@@ -1,0 +1,364 @@
+/* Copyright (c) 2023 Renmin University of China
+RMDB is licensed under Mulan PSL v2.
+You can use this software according to the terms and conditions of the Mulan PSL v2.
+You may obtain a copy of Mulan PSL v2 at:
+        http://license.coscl.org.cn/MulanPSL2
+THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+See the Mulan PSL v2 for more details. */
+
+#pragma once
+
+#include "execution_defs.h"
+#include "execution_manager.h"
+#include "executor_abstract.h"
+#include "index/ix.h"
+#include "record/rm_scan.h"
+#include "system/sm.h"
+
+#include <limits>
+#include <map>
+#include <unordered_set>
+
+class IndexScanExecutor : public AbstractExecutor {
+   private:
+    std::string tab_name_;                      // 表名称
+    std::string visible_tab_name_;
+    TabMeta tab_;                               // 表的元数据
+    std::vector<Condition> conds_;              // 扫描条件
+    RmFileHandle *fh_;                          // 表的数据文件句柄
+    std::vector<ColMeta> cols_;                 // 需要读取的字段
+    size_t len_;                                // 选取出来的一条记录的长度
+    std::vector<Condition> fed_conds_;          // 扫描条件，和conds_字段相同
+    std::vector<FastCondition> fast_conds_;
+
+    std::vector<std::string> index_col_names_;  // index scan涉及到的索引包含的字段
+    IndexMeta index_meta_;                      // index scan涉及到的索引元数据
+
+    Rid rid_;
+    std::unique_ptr<RmRecord> current_tuple_;
+    std::vector<Rid> index_rids_;
+    size_t index_pos_ = 0;
+
+    SmManager *sm_manager_;
+    std::vector<char> lower_key_;
+    std::vector<char> upper_key_;
+    bool lower_open_ = false;
+    bool upper_open_ = false;
+    int matched_prefix_len_ = 0;
+    bool has_outer_tuple_ = false;
+    const std::vector<Condition> *outer_conds_ = nullptr;
+    const std::vector<ColMeta> *outer_cols_ = nullptr;
+    const char *outer_data_ = nullptr;
+    std::vector<Rid> mvcc_extra_rids_;
+    size_t mvcc_extra_pos_ = 0;
+    std::unordered_set<uint64_t> seen_rids_;
+    bool bounds_empty_ = false;
+    std::vector<ColType> index_col_types_;
+    std::vector<int> index_col_lens_;
+
+   public:
+    IndexScanExecutor(SmManager *sm_manager, std::string tab_name, std::string alias, std::vector<Condition> conds, std::vector<std::string> index_col_names,
+                    Context *context) {
+        sm_manager_ = sm_manager;
+        context_ = context;
+        tab_name_ = std::move(tab_name);
+        visible_tab_name_ = alias.empty() ? tab_name_ : std::move(alias);
+        tab_ = sm_manager_->db_.get_table(tab_name_);
+        conds_ = std::move(conds);
+        // index_no_ = index_no;
+        index_col_names_ = index_col_names;
+        index_meta_ = *(tab_.get_index_meta(index_col_names_));
+        for (auto &col : index_meta_.cols) {
+            index_col_types_.push_back(col.type);
+            index_col_lens_.push_back(col.len);
+        }
+        fh_ = sm_manager_->fhs_.at(tab_name_).get();
+        cols_ = tab_.cols;
+        for (auto &col : cols_) {
+            col.tab_name = visible_tab_name_;
+        }
+        len_ = cols_.back().offset + cols_.back().len;
+        std::map<CompOp, CompOp> swap_op = {
+            {OP_EQ, OP_EQ}, {OP_NE, OP_NE}, {OP_LT, OP_GT}, {OP_GT, OP_LT}, {OP_LE, OP_GE}, {OP_GE, OP_LE},
+        };
+
+        for (auto &cond : conds_) {
+            if (cond.lhs_col.tab_name != visible_tab_name_) {
+                // lhs is on other table, now rhs must be on this table
+                assert(!cond.is_rhs_val && cond.rhs_col.tab_name == visible_tab_name_);
+                // swap lhs and rhs
+                std::swap(cond.lhs_col, cond.rhs_col);
+                cond.op = swap_op.at(cond.op);
+            }
+        }
+        fed_conds_ = conds_;
+        fast_conds_ = compile_conds(fed_conds_, cols_);
+    }
+
+    void set_outer_tuple(const std::vector<Condition> &conds, const std::vector<ColMeta> &outer_cols,
+                         const char *outer_data) override {
+        outer_conds_ = &conds;
+        outer_cols_ = &outer_cols;
+        outer_data_ = outer_data;
+        has_outer_tuple_ = outer_data != nullptr;
+    }
+
+    void beginTuple() override {
+        current_tuple_.reset();
+        index_rids_.clear();
+        index_pos_ = 0;
+        mvcc_extra_rids_.clear();
+        mvcc_extra_pos_ = 0;
+        seen_rids_.clear();
+        if (context_ != nullptr && context_->is_select_ && context_->txn_mgr_ != nullptr) {
+            context_->txn_mgr_->RegisterPredicateRead(context_->txn_, tab_name_, fed_conds_, cols_);
+        }
+        auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_meta_.cols)).get();
+        build_index_bounds();
+        if (!bounds_empty_) {
+            ih->collect_range(lower_key_.data(), lower_open_, upper_key_.data(), upper_open_, &index_rids_);
+        }
+        if (context_ != nullptr && context_->txn_mgr_ != nullptr &&
+            context_->txn_mgr_->IsMvccTxn(context_->txn_)) {
+            context_->txn_mgr_->CollectVisibleVersionRids(tab_name_, index_col_names_, lower_key_, lower_open_,
+                                                          upper_key_, upper_open_, fed_conds_, cols_, context_->txn_,
+                                                          &mvcc_extra_rids_);
+        }
+        find_next_valid();
+    }
+
+    void nextTuple() override {
+        find_next_valid();
+    }
+
+    std::unique_ptr<RmRecord> Next() override {
+        if (is_end()) {
+            return nullptr;
+        }
+        return std::make_unique<RmRecord>(*current_tuple_);
+    }
+
+    bool is_end() const override { return current_tuple_ == nullptr; }
+
+    size_t tupleLen() const override { return len_; }
+
+    const std::vector<ColMeta> &cols() const override { return cols_; }
+
+    std::string getType() override { return "IndexScanExecutor"; }
+
+    ColMeta get_col_offset(const TabCol &target) override { return *get_col(cols_, target); }
+
+    Rid &rid() override { return rid_; }
+
+   private:
+    static uint64_t rid_key(const Rid &rid) {
+        return (static_cast<uint64_t>(static_cast<uint32_t>(rid.page_no)) << 32) |
+               static_cast<uint32_t>(rid.slot_no);
+    }
+
+    void find_next_valid() {
+        current_tuple_.reset();
+        while (index_pos_ < index_rids_.size()) {
+            rid_ = index_rids_[index_pos_++];
+            if (!mvcc_extra_rids_.empty()) {
+                seen_rids_.insert(rid_key(rid_));
+            }
+            rows_++;
+            std::unique_ptr<RmRecord> rec;
+            if (context_ != nullptr && context_->txn_mgr_ != nullptr) {
+                rec = context_->txn_mgr_->GetVisibleRecord(tab_name_, fh_, rid_, context_->txn_);
+            } else {
+                rec = fh_->get_record(rid_, context_);
+            }
+            if (rec == nullptr) {
+                continue;
+            }
+            if (eval_compiled_conds(fast_conds_, rec->data)) {
+                if (context_ != nullptr && context_->is_select_ && context_->txn_mgr_ != nullptr) {
+                    context_->txn_mgr_->RegisterRecordRead(context_->txn_, tab_name_, rid_);
+                }
+                current_tuple_ = std::move(rec);
+                return;
+            }
+        }
+        while (mvcc_extra_pos_ < mvcc_extra_rids_.size()) {
+            rid_ = mvcc_extra_rids_[mvcc_extra_pos_++];
+            if (!seen_rids_.empty() && !seen_rids_.insert(rid_key(rid_)).second) {
+                continue;
+            }
+            rows_++;
+            std::unique_ptr<RmRecord> rec;
+            if (context_ != nullptr && context_->txn_mgr_ != nullptr) {
+                rec = context_->txn_mgr_->GetVisibleRecord(tab_name_, fh_, rid_, context_->txn_);
+            } else {
+                rec = fh_->get_record(rid_, context_);
+            }
+            if (rec == nullptr || !eval_compiled_conds(fast_conds_, rec->data)) {
+                continue;
+            }
+            if (context_ != nullptr && context_->is_select_ && context_->txn_mgr_ != nullptr) {
+                context_->txn_mgr_->RegisterRecordRead(context_->txn_, tab_name_, rid_);
+            }
+            current_tuple_ = std::move(rec);
+            return;
+        }
+    }
+
+    void fill_lowest(char *dest, const ColMeta &col) {
+        switch (col.type) {
+            case TYPE_INT: {
+                int v = std::numeric_limits<int>::min();
+                memcpy(dest, &v, sizeof(int));
+                break;
+            }
+            case TYPE_FLOAT: {
+                float v = -std::numeric_limits<float>::max();
+                memcpy(dest, &v, sizeof(float));
+                break;
+            }
+            case TYPE_STRING:
+                memset(dest, 0, col.len);
+                break;
+            default:
+                throw InternalError("Unexpected data type");
+        }
+    }
+
+    void fill_highest(char *dest, const ColMeta &col) {
+        switch (col.type) {
+            case TYPE_INT: {
+                int v = std::numeric_limits<int>::max();
+                memcpy(dest, &v, sizeof(int));
+                break;
+            }
+            case TYPE_FLOAT: {
+                float v = std::numeric_limits<float>::max();
+                memcpy(dest, &v, sizeof(float));
+                break;
+            }
+            case TYPE_STRING:
+                memset(dest, 0xff, col.len);
+                break;
+            default:
+                throw InternalError("Unexpected data type");
+        }
+    }
+
+    void build_index_bounds() {
+        lower_open_ = false;
+        upper_open_ = false;
+        bounds_empty_ = false;
+        matched_prefix_len_ = 0;
+        lower_key_.assign(index_meta_.col_tot_len, 0);
+        upper_key_.assign(index_meta_.col_tot_len, 0);
+        int offset = 0;
+        for (auto &col : index_meta_.cols) {
+            fill_lowest(lower_key_.data() + offset, col);
+            fill_highest(upper_key_.data() + offset, col);
+            offset += col.len;
+        }
+
+        std::map<std::string, std::vector<Condition>> cond_map;
+        for (auto cond : conds_) {
+            if (!cond.is_rhs_val || cond.lhs_col.tab_name != visible_tab_name_) {
+                continue;
+            }
+            cond_map[cond.lhs_col.col_name].push_back(cond);
+        }
+        if (has_outer_tuple_ && outer_conds_ != nullptr && outer_cols_ != nullptr) {
+            for (auto cond : *outer_conds_) {
+                if (cond.op != OP_EQ || cond.is_rhs_val) {
+                    continue;
+                }
+                if (cond.lhs_col.tab_name == visible_tab_name_) {
+                    auto outer_col = get_col(*outer_cols_, cond.rhs_col);
+                    cond.is_rhs_val = true;
+                    cond.rhs_col = {};
+                    fill_value_from_outer(cond.rhs_val, *outer_col, outer_data_ + outer_col->offset);
+                    cond_map[cond.lhs_col.col_name].push_back(cond);
+                } else if (cond.rhs_col.tab_name == visible_tab_name_) {
+                    auto outer_col = get_col(*outer_cols_, cond.lhs_col);
+                    Condition bound;
+                    bound.lhs_col = cond.rhs_col;
+                    bound.op = OP_EQ;
+                    bound.is_rhs_val = true;
+                    fill_value_from_outer(bound.rhs_val, *outer_col, outer_data_ + outer_col->offset);
+                    cond_map[bound.lhs_col.col_name].push_back(bound);
+                }
+            }
+        }
+
+        offset = 0;
+        bool range_seen = false;
+        for (auto &col : index_meta_.cols) {
+            auto it = cond_map.find(col.name);
+            if (it == cond_map.end() || range_seen) {
+                break;
+            }
+            Condition *eq = nullptr;
+            Condition *lower = nullptr;
+            Condition *upper = nullptr;
+            for (auto &cond : it->second) {
+                if (cond.rhs_val.raw == nullptr) {
+                    cond.rhs_val.init_raw(col.len);
+                }
+                switch (cond.op) {
+                    case OP_EQ:
+                        eq = &cond;
+                        break;
+                    case OP_GT:
+                    case OP_GE:
+                        if (lower == nullptr || ix_compare(cond.rhs_val.raw->data, lower->rhs_val.raw->data, col.type, col.len) > 0) {
+                            lower = &cond;
+                        }
+                        break;
+                    case OP_LT:
+                    case OP_LE:
+                        if (upper == nullptr || ix_compare(cond.rhs_val.raw->data, upper->rhs_val.raw->data, col.type, col.len) < 0) {
+                            upper = &cond;
+                        }
+                        break;
+                    default:
+                        break;
+                }
+            }
+            if (eq != nullptr) {
+                memcpy(lower_key_.data() + offset, eq->rhs_val.raw->data, col.len);
+                memcpy(upper_key_.data() + offset, eq->rhs_val.raw->data, col.len);
+                matched_prefix_len_++;
+            } else {
+                if (lower != nullptr) {
+                    memcpy(lower_key_.data() + offset, lower->rhs_val.raw->data, col.len);
+                    lower_open_ = lower->op == OP_GT;
+                }
+                if (upper != nullptr) {
+                    memcpy(upper_key_.data() + offset, upper->rhs_val.raw->data, col.len);
+                    upper_open_ = upper->op == OP_LT;
+                }
+                range_seen = true;
+                matched_prefix_len_++;
+            }
+            offset += col.len;
+        }
+        int cmp = ix_compare(lower_key_.data(), upper_key_.data(), index_col_types_, index_col_lens_);
+        bounds_empty_ = cmp > 0 || (cmp == 0 && (lower_open_ || upper_open_));
+    }
+
+    void fill_value_from_outer(Value &val, const ColMeta &col, const char *data) {
+        val.type = col.type;
+        val.raw_text.clear();
+        if (col.type == TYPE_INT) {
+            val.int_val = *reinterpret_cast<const int *>(data);
+        } else if (col.type == TYPE_FLOAT) {
+            val.float_val = *reinterpret_cast<const float *>(data);
+        } else if (col.type == TYPE_STRING) {
+            val.str_val.assign(data, strnlen(data, col.len));
+        } else {
+            throw InternalError("Unexpected data type");
+        }
+        val.raw = std::make_shared<RmRecord>(col.len);
+        memcpy(val.raw->data, data, col.len);
+    }
+};
