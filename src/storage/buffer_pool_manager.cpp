@@ -56,7 +56,7 @@ void BufferPoolManager::update_page(BufferPoolShard &shard, Page *page, PageId n
     }
     if (page->is_dirty_.load(std::memory_order_acquire) && page->id_.page_no != INVALID_PAGE_ID) {
         if (log_manager_ != nullptr) {
-            log_manager_->flush_log_to_disk();
+            log_manager_->flush_log_to_disk(true);
         }
         disk_manager_->write_page(page->id_.fd, page->id_.page_no, page->data_, PAGE_SIZE);
         page->is_dirty_.store(false, std::memory_order_release);
@@ -148,7 +148,7 @@ bool BufferPoolManager::flush_page(PageId page_id) {
     frame_id_t frame_id = it->second;
     Page *page = &shard.pages_[frame_id];
     if (log_manager_ != nullptr && page->is_dirty_.load(std::memory_order_acquire)) {
-        log_manager_->flush_log_to_disk();
+        log_manager_->flush_log_to_disk(true);
     }
     disk_manager_->write_page(page_id.fd, page_id.page_no, page->data_, PAGE_SIZE);
     page->is_dirty_.store(false, std::memory_order_release);
@@ -201,7 +201,7 @@ bool BufferPoolManager::delete_page(PageId page_id) {
 
     if (page->is_dirty_.load(std::memory_order_acquire)) {
         if (log_manager_ != nullptr) {
-            log_manager_->flush_log_to_disk();
+            log_manager_->flush_log_to_disk(true);
         }
         disk_manager_->write_page(page_id.fd, page_id.page_no, page->data_, PAGE_SIZE);
         page->is_dirty_.store(false, std::memory_order_release);
@@ -232,7 +232,7 @@ void BufferPoolManager::flush_all_pages(int fd) {
                 continue;
             }
             if (log_manager_ != nullptr) {
-                log_manager_->flush_log_to_disk();
+                log_manager_->flush_log_to_disk(true);
             }
             disk_manager_->write_page(page->id_.fd, page->id_.page_no, page->data_, PAGE_SIZE);
             page->is_dirty_.store(false, std::memory_order_release);

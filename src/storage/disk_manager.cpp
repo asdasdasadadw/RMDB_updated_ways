@@ -283,3 +283,12 @@ void DiskManager::sync_log() {
         throw UnixError();
     }
 }
+
+void DiskManager::sync_file(int fd) {
+    if (fd < 0) {
+        throw FileNotOpenError(fd);
+    }
+    if (fdatasync(fd) < 0) {
+        throw UnixError();
+    }
+}

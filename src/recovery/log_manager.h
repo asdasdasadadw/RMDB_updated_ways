@@ -341,7 +341,6 @@ public:
     
     lsn_t add_log_to_buffer(LogRecord* log_record);
     void flush_log_to_disk(bool durable = false);
-    lsn_t persistent_lsn() const { return persist_lsn_; }
 
     LogBuffer* get_log_buffer() { return active_buffer_; }
 
@@ -357,6 +356,7 @@ private:
     LogBuffer *active_buffer_{&log_buffer_a_};
     LogBuffer *flush_buffer_{&log_buffer_b_};
     lsn_t persist_lsn_{INVALID_LSN};    // 记录已经持久化到磁盘中的最后一条日志的日志号
+    lsn_t durable_lsn_{INVALID_LSN};    // 已经通过 fdatasync 持久化的最后一条日志的日志号
     lsn_t next_lsn_{INVALID_LSN};       // 下一条日志在文件中的字节偏移
     bool flushing_{false};
     DiskManager* disk_manager_;

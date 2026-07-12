@@ -17,7 +17,7 @@ See the Mulan PSL v2 for more details. */
 #include "record/rm_defs.h"
 
 /* 标识事务状态 */
-enum class TransactionState { DEFAULT, GROWING, SHRINKING, COMMITTED, ABORTED };
+enum class TransactionState { DEFAULT, GROWING, SHRINKING, COMMITTING, COMMITTED, ABORTED };
 
 /* 系统的隔离级别，当前赛题中为可串行化隔离级别 */
 enum class IsolationLevel { READ_UNCOMMITTED, REPEATABLE_READ, READ_COMMITTED, SNAPSHOT_ISOLATION, SERIALIZABLE };

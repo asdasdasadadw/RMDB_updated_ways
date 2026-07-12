@@ -69,21 +69,64 @@ std::vector<std::unique_lock<std::mutex>> lock_index_keys(TransactionManager *tx
     return txn_mgr->LockIndexKeys(std::move(keys));
 }
 
+bool index_entry_points_to_rid(IxIndexHandle *ih, const std::vector<char> &key, const Rid &rid,
+                               Transaction *txn) {
+    std::vector<Rid> values;
+    return ih->get_value(key.data(), &values, txn) &&
+           std::find(values.begin(), values.end(), rid) != values.end();
+}
+
+void ensure_index_entry_for_rid(IxIndexHandle *ih, const std::vector<char> &key, const Rid &rid,
+                                Transaction *txn) {
+    std::vector<Rid> values;
+    if (ih->get_value(key.data(), &values, txn)) {
+        if (std::find(values.begin(), values.end(), rid) != values.end()) {
+            return;
+        }
+        throw InternalError("Index rollback key belongs to a different record");
+    }
+
+    page_id_t inserted_page = ih->insert_entry(key.data(), rid, txn);
+    bool restored = index_entry_points_to_rid(ih, key, rid, txn);
+    if (inserted_page == IX_NO_PAGE && !restored) {
+        throw InternalError("Index rollback insert was rejected");
+    }
+    if (!restored) {
+        throw InternalError("Failed to restore index entry during rollback");
+    }
+}
+
+void delete_index_entry_for_rid(IxIndexHandle *ih, const std::vector<char> &key, const Rid &rid,
+                                Transaction *txn) {
+    if (index_entry_points_to_rid(ih, key, rid, txn)) {
+        ih->delete_entry(key.data(), txn);
+        if (index_entry_points_to_rid(ih, key, rid, txn)) {
+            throw InternalError("Failed to remove index entry during rollback");
+        }
+    }
+}
+
+void validate_index_entries_restorable(SmManager *sm_manager, const TabMeta &tab,
+                                       const std::string &tab_name, const RmRecord &rec,
+                                       const Rid &rid, Transaction *txn) {
+    for (const auto &index : tab.indexes) {
+        auto ih = sm_manager->ihs_.at(
+            sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
+        auto key = make_index_key(rec, index);
+        std::vector<Rid> values;
+        if (ih->get_value(key.data(), &values, txn) &&
+            std::find(values.begin(), values.end(), rid) == values.end()) {
+            throw InternalError("Index rollback key belongs to a different record");
+        }
+    }
+}
+
 void insert_indexes(SmManager *sm_manager, const TabMeta &tab, const std::string &tab_name,
                     const RmRecord &rec, const Rid &rid, Transaction *txn) {
     for (const auto &index : tab.indexes) {
         auto ih = sm_manager->ihs_.at(sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
         auto key = make_index_key(rec, index);
-        ih->insert_entry(key.data(), rid, txn);
-    }
-}
-
-void delete_indexes(SmManager *sm_manager, const TabMeta &tab, const std::string &tab_name,
-                    const RmRecord &rec, Transaction *txn) {
-    for (const auto &index : tab.indexes) {
-        auto ih = sm_manager->ihs_.at(sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
-        auto key = make_index_key(rec, index);
-        ih->delete_entry(key.data(), txn);
+        ensure_index_entry_for_rid(ih, key, rid, txn);
     }
 }
 
@@ -92,13 +135,7 @@ void delete_indexes_for_rid(SmManager *sm_manager, const TabMeta &tab, const std
     for (const auto &index : tab.indexes) {
         auto ih = sm_manager->ihs_.at(sm_manager->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
         auto key = make_index_key(rec, index);
-        std::vector<Rid> values;
-        if (!ih->get_value(key.data(), &values, txn)) {
-            continue;
-        }
-        if (std::find(values.begin(), values.end(), rid) != values.end()) {
-            ih->delete_entry(key.data(), txn);
-        }
+        delete_index_entry_for_rid(ih, key, rid, txn);
     }
 }
 
@@ -502,6 +539,9 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
         txn->get_state() == TransactionState::ABORTED) {
         return;
     }
+    if (txn->get_state() == TransactionState::COMMITTING) {
+        throw InternalError("Transaction commit outcome is pending");
+    }
     auto write_set = txn->get_write_set();
     if ((write_set == nullptr || write_set->empty()) && !IsSerializableTxn(txn)) {
         txn->set_state(TransactionState::COMMITTED);
@@ -509,14 +549,6 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
         TransactionManager::txn_map.erase(txn->get_transaction_id());
         return;
     }
-    if (log_manager != nullptr && txn->get_prev_lsn() != INVALID_LSN) {
-        CommitLogRecord log_record(txn->get_transaction_id());
-        log_record.prev_lsn_ = txn->get_prev_lsn();
-        lsn_t lsn = log_manager->add_log_to_buffer(&log_record);
-        txn->set_prev_lsn(lsn);
-        log_manager->flush_log_to_disk();
-    }
-    timestamp_t commit_ts;
     std::vector<RecordKey> touched_keys;
     auto add_touched_key = [&](RecordKey key) {
         for (const auto &existing : touched_keys) {
@@ -528,18 +560,110 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     };
     if (write_set != nullptr) {
         touched_keys.reserve(write_set->size());
+        for (auto &write_record : *write_set) {
+            add_touched_key(RecordKey{write_record.GetTableName(), write_record.GetRid()});
+        }
     }
-    bool should_materialize = false;
+
+    struct CommitCacheTableContext {
+        TabMeta *tab{nullptr};
+        RmFileHandle *fh{nullptr};
+        bool has_cache{false};
+    };
+    std::unordered_map<std::string, CommitCacheTableContext> cache_table_contexts;
+    auto get_cache_table_context = [&](const std::string &tab_name) -> CommitCacheTableContext & {
+        auto it = cache_table_contexts.find(tab_name);
+        if (it != cache_table_contexts.end()) {
+            return it->second;
+        }
+        CommitCacheTableContext context;
+        context.tab = &sm_manager_->db_.get_table(tab_name);
+        context.has_cache = RuntimeFilterCache::Get().has_table_entries(tab_name);
+        auto [insert_it, _] = cache_table_contexts.emplace(tab_name, context);
+        return insert_it->second;
+    };
+
+    // Before publishing the commit, add every new cache candidate without
+    // removing the old one.  Readers can safely filter these false positives
+    // through MVCC, while a reader that starts after publication can never
+    // miss the new key even if materialization runs immediately afterwards.
+    if (IsMvccTxn(txn) && write_set != nullptr) {
+        cache_table_contexts.reserve(write_set->size());
+        for (auto &write_record : *write_set) {
+            const std::string &tab_name = write_record.GetTableName();
+            auto &table_context = get_cache_table_context(tab_name);
+            if (!table_context.has_cache) {
+                continue;
+            }
+            Rid rid = write_record.GetRid();
+            switch (write_record.GetWriteType()) {
+                case WType::INSERT_TUPLE:
+                    if (write_record.GetRecord().allocated_) {
+                        RuntimeFilterCache::Get().insert_record(tab_name, rid, write_record.GetRecord(),
+                                                                *table_context.tab);
+                    } else {
+                        if (table_context.fh == nullptr) {
+                            table_context.fh = sm_manager_->fhs_.at(tab_name).get();
+                        }
+                        auto new_rec = table_context.fh->get_record(rid, nullptr);
+                        RuntimeFilterCache::Get().insert_record(tab_name, rid, *new_rec, *table_context.tab);
+                    }
+                    break;
+                case WType::UPDATE_TUPLE: {
+                    if (table_context.fh == nullptr) {
+                        table_context.fh = sm_manager_->fhs_.at(tab_name).get();
+                    }
+                    auto new_rec = table_context.fh->get_record(rid, nullptr);
+                    RuntimeFilterCache::Get().update_record(tab_name, rid, write_record.GetRecord(), *new_rec,
+                                                            *table_context.tab, true);
+                    break;
+                }
+                case WType::DELETE_TUPLE:
+                default:
+                    break;
+            }
+        }
+    }
+
+    if (IsSerializableTxn(txn)) {
+        std::unique_lock<std::shared_mutex> mvcc_lock(mvcc_latch_);
+        auto info_it = serializable_txns_.find(txn->get_transaction_id());
+        if (info_it != serializable_txns_.end()) {
+            info_it->second.state = TransactionState::COMMITTING;
+        }
+        txn->set_state(TransactionState::COMMITTING);
+    } else {
+        txn->set_state(TransactionState::COMMITTING);
+    }
+
+    // From the moment the COMMIT record enters the shared WAL buffer another
+    // group flusher may make it durable.  COMMITTING is therefore an
+    // irreversible state: no later error may route this transaction to abort.
+    if (log_manager != nullptr && txn->get_prev_lsn() != INVALID_LSN) {
+        CommitLogRecord log_record(txn->get_transaction_id());
+        log_record.prev_lsn_ = txn->get_prev_lsn();
+        lsn_t lsn;
+        try {
+            lsn = log_manager->add_log_to_buffer(&log_record);
+        } catch (...) {
+            std::unique_lock<std::shared_mutex> mvcc_lock(mvcc_latch_);
+            auto info_it = serializable_txns_.find(txn->get_transaction_id());
+            if (info_it != serializable_txns_.end()) {
+                info_it->second.state = TransactionState::GROWING;
+            }
+            txn->set_state(TransactionState::GROWING);
+            throw;
+        }
+        txn->set_prev_lsn(lsn);
+        log_manager->flush_log_to_disk(true);
+    }
+
+    timestamp_t commit_ts;
     {
         std::unique_lock<std::shared_mutex> mvcc_lock(mvcc_latch_);
         commit_ts = last_commit_ts_.load() + 1;
         txn->set_commit_ts(commit_ts);
         txn_id_t txn_id = txn->get_transaction_id();
-        if (write_set != nullptr) {
-            for (auto &write_record : *write_set) {
-                add_touched_key(RecordKey{write_record.GetTableName(), write_record.GetRid()});
-            }
-        }
         for (const auto &key : touched_keys) {
             auto it = versions_.find(key);
             if (it == versions_.end()) {
@@ -558,99 +682,90 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
             info_it->second.commit_ts = commit_ts;
         }
         last_commit_ts_.store(commit_ts);
+        txn->set_state(TransactionState::COMMITTED);
+    }
+
+    // COMMIT is durable and the core MVCC state is published.  Everything
+    // below is maintenance only: a cache or GC failure must never reverse the
+    // transaction outcome or escape as a client-visible commit failure.
+    try {
+        if (IsMvccTxn(txn) && write_set != nullptr) {
+            for (auto &write_record : *write_set) {
+                const std::string &tab_name = write_record.GetTableName();
+                auto &table_context = cache_table_contexts.at(tab_name);
+                if (!table_context.has_cache) {
+                    continue;
+                }
+                Rid rid = write_record.GetRid();
+                switch (write_record.GetWriteType()) {
+                    case WType::INSERT_TUPLE:
+                        break;
+                    case WType::UPDATE_TUPLE: {
+                        if (table_context.fh == nullptr) {
+                            table_context.fh = sm_manager_->fhs_.at(tab_name).get();
+                        }
+                        try {
+                            auto new_rec = table_context.fh->get_record(rid, nullptr);
+                            RuntimeFilterCache::Get().update_record(tab_name, rid, write_record.GetRecord(),
+                                                                    *new_rec, *table_context.tab, false);
+                        } catch (RecordNotFoundError &) {
+                        }
+                        break;
+                    }
+                    case WType::DELETE_TUPLE:
+                        RuntimeFilterCache::Get().delete_record(tab_name, rid, write_record.GetRecord(),
+                                                                *table_context.tab, false);
+                        break;
+                    default:
+                        break;
+                }
+            }
+        }
+    } catch (...) {
+        // The pre-publish pass already installed every new candidate.  A
+        // cleanup failure only leaves false positives, which MVCC visibility
+        // and predicate checks filter out safely.
+    }
+    if (write_set != nullptr) {
+        write_set->clear();
+    }
+
+    try {
+        std::unique_lock<std::shared_mutex> lock(txn_map_mutex_);
+        TransactionManager::txn_map.erase(txn->get_transaction_id());
+    } catch (...) {
+    }
+
+    bool should_materialize = false;
+    try {
+        std::unique_lock<std::shared_mutex> mvcc_lock(mvcc_latch_);
         for (const auto &key : touched_keys) {
             EnqueueMaterializeKeyLocked(key);
         }
         should_materialize = !materialize_queue_.empty() &&
                              commit_ts % MVCC_MATERIALIZE_INTERVAL == 0;
+    } catch (...) {
+        should_materialize = false;
     }
     if (should_materialize) {
-        timestamp_t materialize_ts = OldestActiveStartTsLocked(txn->get_transaction_id());
-        std::shared_lock<std::shared_mutex> gc_read_lock(mvcc_gc_latch_);
-        bool needs_gc = false;
-        {
-            std::shared_lock<std::shared_mutex> mvcc_lock(mvcc_latch_);
-            needs_gc = !materialize_queue_.empty();
-        }
-        gc_read_lock.unlock();
-        if (needs_gc) {
-            std::unique_lock<std::shared_mutex> gc_lock(mvcc_gc_latch_);
-            std::unique_lock<std::shared_mutex> mvcc_lock(mvcc_latch_);
-            if (!materialize_queue_.empty()) {
-                MaterializeCommittedVersionsLocked(materialize_ts, MVCC_MATERIALIZE_BUDGET);
+        try {
+            timestamp_t materialize_ts = OldestActiveStartTsLocked(txn->get_transaction_id());
+            std::shared_lock<std::shared_mutex> gc_read_lock(mvcc_gc_latch_);
+            bool needs_gc = false;
+            {
+                std::shared_lock<std::shared_mutex> mvcc_lock(mvcc_latch_);
+                needs_gc = !materialize_queue_.empty();
             }
-        }
-    }
-    if (IsMvccTxn(txn) && write_set != nullptr) {
-        struct TableContext {
-            TabMeta *tab{nullptr};
-            RmFileHandle *fh{nullptr};
-            bool has_cache{false};
-        };
-        std::unordered_map<std::string, TableContext> table_contexts;
-        table_contexts.reserve(write_set->size());
-        auto get_table_context = [&](const std::string &tab_name) -> TableContext & {
-            auto it = table_contexts.find(tab_name);
-            if (it != table_contexts.end()) {
-                return it->second;
-            }
-            TableContext context;
-            context.tab = &sm_manager_->db_.get_table(tab_name);
-            context.has_cache = RuntimeFilterCache::Get().has_table_entries(tab_name);
-            auto [insert_it, _] = table_contexts.emplace(tab_name, context);
-            return insert_it->second;
-        };
-        for (auto &write_record : *write_set) {
-            const std::string &tab_name = write_record.GetTableName();
-            auto &table_context = get_table_context(tab_name);
-            if (!table_context.has_cache) {
-                continue;
-            }
-            Rid rid = write_record.GetRid();
-            switch (write_record.GetWriteType()) {
-                case WType::INSERT_TUPLE:
-                    if (write_record.GetRecord().allocated_) {
-                        RuntimeFilterCache::Get().insert_record(tab_name, rid, write_record.GetRecord(),
-                                                                *table_context.tab);
-                    } else if (table_context.has_cache) {
-                        if (table_context.fh == nullptr) {
-                            table_context.fh = sm_manager_->fhs_.at(tab_name).get();
-                        }
-                        try {
-                            auto rec = table_context.fh->get_record(rid, nullptr);
-                            RuntimeFilterCache::Get().insert_record(tab_name, rid, *rec, *table_context.tab);
-                        } catch (RecordNotFoundError &) {
-                        }
-                    }
-                    break;
-                case WType::UPDATE_TUPLE: {
-                    if (table_context.fh == nullptr) {
-                        table_context.fh = sm_manager_->fhs_.at(tab_name).get();
-                    }
-                    try {
-                        auto new_rec = table_context.fh->get_record(rid, nullptr);
-                        RuntimeFilterCache::Get().update_record(tab_name, rid, write_record.GetRecord(), *new_rec,
-                                                                *table_context.tab, false);
-                    } catch (RecordNotFoundError &) {
-                    }
-                    break;
+            gc_read_lock.unlock();
+            if (needs_gc) {
+                std::unique_lock<std::shared_mutex> gc_lock(mvcc_gc_latch_);
+                std::unique_lock<std::shared_mutex> mvcc_lock(mvcc_latch_);
+                if (!materialize_queue_.empty()) {
+                    MaterializeCommittedVersionsLocked(materialize_ts, MVCC_MATERIALIZE_BUDGET);
                 }
-                case WType::DELETE_TUPLE:
-                    RuntimeFilterCache::Get().delete_record(tab_name, rid, write_record.GetRecord(),
-                                                            *table_context.tab, false);
-                    break;
-                default:
-                    break;
             }
+        } catch (...) {
         }
-    }
-    if (write_set != nullptr) {
-        write_set->clear();
-    }
-    txn->set_state(TransactionState::COMMITTED);
-    {
-        std::unique_lock<std::shared_mutex> lock(txn_map_mutex_);
-        TransactionManager::txn_map.erase(txn->get_transaction_id());
     }
 }
 
@@ -663,7 +778,9 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
     if (txn == nullptr) {
         return;
     }
-    if (txn->get_state() == TransactionState::ABORTED) {
+    if (txn->get_state() == TransactionState::COMMITTING ||
+        txn->get_state() == TransactionState::COMMITTED ||
+        txn->get_state() == TransactionState::ABORTED) {
         return;
     }
     std::vector<RecordKey> touched_keys;
@@ -729,7 +846,7 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
                 std::vector<std::string> index_keys;
                 append_index_lock_keys(tab_name, tab, *rec, &index_keys);
                 auto index_locks = lock_index_keys(this, std::move(index_keys));
-                delete_indexes(sm_manager_, tab, tab_name, *rec, txn);
+                delete_indexes_for_rid(sm_manager_, tab, tab_name, *rec, rid, txn);
                 if (fh->is_record(rid)) {
                     fh->delete_record(rid, nullptr);
                 }
@@ -743,6 +860,7 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
                 std::vector<std::string> index_keys;
                 append_index_lock_keys(tab_name, tab, old_rec, &index_keys);
                 auto index_locks = lock_index_keys(this, std::move(index_keys));
+                validate_index_entries_restorable(sm_manager_, tab, tab_name, old_rec, rid, txn);
                 if (!fh->is_record(rid)) {
                     fh->insert_record(rid, old_rec.data);
                 }
@@ -759,23 +877,17 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
                 append_index_lock_keys(tab_name, tab, old_rec, &index_keys);
                 append_index_lock_keys(tab_name, tab, *cur_rec, &index_keys);
                 auto index_locks = lock_index_keys(this, std::move(index_keys));
+                validate_index_entries_restorable(sm_manager_, tab, tab_name, old_rec, rid, txn);
                 for (const auto &index : tab.indexes) {
                     if (!index_key_changed(old_rec, *cur_rec, index)) {
                         continue;
                     }
                     auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
                     auto key = make_index_key(*cur_rec, index);
-                    ih->delete_entry(key.data(), txn);
+                    delete_index_entry_for_rid(ih, key, rid, txn);
                 }
                 fh->update_record(rid, old_rec.data, nullptr);
-                for (const auto &index : tab.indexes) {
-                    if (!index_key_changed(old_rec, *cur_rec, index)) {
-                        continue;
-                    }
-                    auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name, index.cols)).get();
-                    auto key = make_index_key(old_rec, index);
-                    ih->insert_entry(key.data(), rid, txn);
-                }
+                insert_indexes(sm_manager_, tab, tab_name, old_rec, rid, txn);
                 if (table_context.has_cache) {
                     RuntimeFilterCache::Get().update_record(tab_name, rid, *cur_rec, old_rec, tab, false);
                 }
@@ -822,7 +934,7 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
         log_record.prev_lsn_ = txn->get_prev_lsn();
         lsn_t lsn = log_manager->add_log_to_buffer(&log_record);
         txn->set_prev_lsn(lsn);
-        log_manager->flush_log_to_disk();
+        log_manager->flush_log_to_disk(true);
     }
     txn->set_state(TransactionState::ABORTED);
     {
@@ -840,7 +952,9 @@ void TransactionManager::GarbageCollection() {
 bool TransactionManager::has_active_transaction() {
     std::shared_lock<std::shared_mutex> lock(txn_map_mutex_);
     for (const auto &entry : TransactionManager::txn_map) {
-        if (entry.second != nullptr && entry.second->get_state() == TransactionState::GROWING) {
+        if (entry.second != nullptr &&
+            (entry.second->get_state() == TransactionState::GROWING ||
+             entry.second->get_state() == TransactionState::COMMITTING)) {
             return true;
         }
     }
@@ -1449,8 +1563,14 @@ void TransactionManager::CleanupSerializableTxnLocked(txn_id_t txn_id) {
 }
 
 void TransactionManager::EnqueueMaterializeKeyLocked(const RecordKey &key) {
-    if (materialize_pending_.insert(key).second) {
-        materialize_queue_.push_back(key);
+    auto [it, inserted] = materialize_pending_.insert(key);
+    if (inserted) {
+        try {
+            materialize_queue_.push_back(key);
+        } catch (...) {
+            materialize_pending_.erase(it);
+            throw;
+        }
     }
 }
 
@@ -1499,7 +1619,8 @@ bool TransactionManager::MaterializeCommittedVersionLocked(const RecordKey &key,
                 delete_indexes_for_rid(sm_manager_, tab, key.tab_name, *current, key.rid, nullptr);
                 fh->delete_record(key.rid, nullptr);
             }
-        } catch (RMDBError &) {
+        } catch (...) {
+            return true;
         }
         chain.clear();
     }
@@ -1523,7 +1644,9 @@ timestamp_t TransactionManager::OldestActiveStartTsLocked(txn_id_t ignored_txn_i
     for (const auto &entry : txn_map) {
         Transaction *txn = entry.second;
         if (txn == nullptr || txn->get_transaction_id() == ignored_txn_id ||
-            txn->get_state() != TransactionState::GROWING || !IsMvccTxn(txn)) {
+            (txn->get_state() != TransactionState::GROWING &&
+             txn->get_state() != TransactionState::COMMITTING) ||
+            !IsMvccTxn(txn)) {
             continue;
         }
         oldest = std::min(oldest, txn->get_start_ts());

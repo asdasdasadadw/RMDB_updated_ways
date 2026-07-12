@@ -218,6 +218,7 @@ class IxIndexHandle {
         file_hdr_->serialize(data);
         disk_manager_->write_page(fd_, IX_FILE_HDR_PAGE, data, file_hdr_->tot_len_);
         delete[] data;
+        disk_manager_->sync_file(fd_);
     }
 
    private:

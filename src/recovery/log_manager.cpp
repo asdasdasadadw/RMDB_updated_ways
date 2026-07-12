@@ -13,6 +13,7 @@ See the Mulan PSL v2 for more details. */
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <exception>
 
 namespace {
 
@@ -27,6 +28,7 @@ void LogManager::init_lsn_locked() {
     int file_size = disk_manager_->is_file(LOG_FILE_NAME) ? disk_manager_->get_file_size(LOG_FILE_NAME) : 0;
     next_lsn_ = std::max(0, file_size);
     persist_lsn_ = next_lsn_ == 0 ? INVALID_LSN : next_lsn_ - 1;
+    durable_lsn_ = persist_lsn_;
 }
 
 void LogManager::flush_log_to_disk_locked(std::unique_lock<std::mutex> *lock, bool durable) {
@@ -35,28 +37,45 @@ void LogManager::flush_log_to_disk_locked(std::unique_lock<std::mutex> *lock, bo
     lsn_t flush_lsn = INVALID_LSN;
     if (!prepare_flush_locked(&flush_buffer, &flush_size, &flush_lsn)) {
         if (durable) {
-            if (lock != nullptr && lock->owns_lock()) {
-                lock->unlock();
-                disk_manager_->sync_log();
-                lock->lock();
-            } else {
-                disk_manager_->sync_log();
+            lsn_t sync_lsn = persist_lsn_;
+            try {
+                if (lock != nullptr && lock->owns_lock()) {
+                    lock->unlock();
+                    disk_manager_->sync_log();
+                    lock->lock();
+                } else {
+                    disk_manager_->sync_log();
+                }
+            } catch (...) {
+                // Once WAL I/O has started its outcome is unknown.  Continuing
+                // would either strand flushing_ or allow pages/transactions to
+                // advance past an unverified WAL boundary, so recovery must
+                // resolve the outcome in a fresh process.
+                std::terminate();
             }
+            durable_lsn_ = std::max(durable_lsn_, sync_lsn);
         }
         return;
     }
     if (lock != nullptr && lock->owns_lock()) {
         lock->unlock();
     }
-    disk_manager_->write_log(flush_buffer->buffer_, flush_size);
-    if (durable) {
-        disk_manager_->sync_log();
+    try {
+        disk_manager_->write_log(flush_buffer->buffer_, flush_size);
+        if (durable) {
+            disk_manager_->sync_log();
+        }
+    } catch (...) {
+        std::terminate();
     }
     if (lock != nullptr) {
         lock->lock();
     }
     flush_buffer->reset();
     persist_lsn_ = std::max(persist_lsn_, flush_lsn);
+    if (durable) {
+        durable_lsn_ = std::max(durable_lsn_, flush_lsn);
+    }
     flushing_ = false;
     flush_cv_.notify_all();
 }
@@ -101,7 +120,13 @@ void LogManager::flush_log_to_disk(bool durable) {
     std::unique_lock<std::mutex> lock(latch_);
     init_lsn_locked();
     lsn_t target_lsn = next_lsn_ == 0 ? INVALID_LSN : next_lsn_ - 1;
-    if (target_lsn == INVALID_LSN || persist_lsn_ >= target_lsn) {
+    if (target_lsn == INVALID_LSN) {
+        return;
+    }
+    if (!durable && persist_lsn_ >= target_lsn) {
+        return;
+    }
+    if (durable && durable_lsn_ >= target_lsn) {
         return;
     }
 
@@ -116,8 +141,15 @@ void LogManager::flush_log_to_disk(bool durable) {
         }
         flush_log_to_disk_locked(&lock, durable);
     }
-    if (durable) {
+    if (durable && durable_lsn_ < target_lsn) {
+        lsn_t sync_lsn = persist_lsn_;
         lock.unlock();
-        disk_manager_->sync_log();
+        try {
+            disk_manager_->sync_log();
+        } catch (...) {
+            std::terminate();
+        }
+        lock.lock();
+        durable_lsn_ = std::max(durable_lsn_, sync_lsn);
     }
 }

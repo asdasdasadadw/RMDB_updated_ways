@@ -162,6 +162,7 @@ class IxManager {
         char* data = new char[ih->file_hdr_->tot_len_];
         ih->file_hdr_->serialize(data);
         disk_manager_->write_page(ih->fd_, IX_FILE_HDR_PAGE, data, ih->file_hdr_->tot_len_);
+        disk_manager_->sync_file(ih->fd_);
         for (int page_no = 0; page_no < ih->file_hdr_->num_pages_; ++page_no) {
             buffer_pool_manager_->delete_page(PageId{ih->fd_, page_no});
         }

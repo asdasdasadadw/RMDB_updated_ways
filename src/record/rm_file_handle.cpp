@@ -188,6 +188,7 @@ void RmFileHandle::flush_file_hdr() {
 void RmFileHandle::flush() {
     buffer_pool_manager_->flush_all_pages(fd_);
     flush_file_hdr();
+    disk_manager_->sync_file(fd_);
 }
 
 void RmFileHandle::sync_header_with_disk_size() {

@@ -71,6 +71,8 @@ class DiskManager {
 
     void sync_log();
 
+    void sync_file(int fd);
+
     void SetLogFd(int log_fd) { log_fd_ = log_fd; }
 
     int GetLogFd() { return log_fd_; }
