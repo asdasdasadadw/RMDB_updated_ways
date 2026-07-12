@@ -79,6 +79,8 @@ class InsertExecutor : public AbstractExecutor {
         std::vector<std::string> index_lock_keys;
         index_entries.reserve(tab_->indexes.size());
         index_lock_keys.reserve(tab_->indexes.size());
+        // The append fast path only changes how the heap record is written. Index-key
+        // serialization and uniqueness checks remain mandatory for every insert.
         for (auto &index : tab_->indexes) {
             auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
             std::vector<char> key(index.col_tot_len);
@@ -87,9 +89,7 @@ class InsertExecutor : public AbstractExecutor {
                 memcpy(key.data() + offset, rec.data + col.offset, col.len);
                 offset += col.len;
             }
-            if (!append_insert_fast_path) {
-                index_lock_keys.push_back(make_index_lock_key(tab_name_, index, key));
-            }
+            index_lock_keys.push_back(make_index_lock_key(tab_name_, index, key));
             index_entries.emplace_back(ih, std::move(key));
         }
 
@@ -99,23 +99,21 @@ class InsertExecutor : public AbstractExecutor {
         }
         auto key_locks = lock_index_keys(context_->txn_mgr_, index_lock_keys);
 
-        if (mvcc_insert && !append_insert_fast_path) {
+        if (mvcc_insert) {
             context_->txn_mgr_->CheckInsertConflict(tab_name_, rec, context_->txn_);
         }
-        if (!append_insert_fast_path) {
-            for (auto &entry : index_entries) {
-                std::vector<Rid> existing;
-                if (entry.first->get_value(entry.second.data(), &existing, context_->txn_)) {
-                    if (!mvcc_insert) {
+        for (auto &entry : index_entries) {
+            std::vector<Rid> existing;
+            if (entry.first->get_value(entry.second.data(), &existing, context_->txn_)) {
+                if (!mvcc_insert) {
+                    throw UniqueIndexViolationError();
+                }
+                for (const auto &existing_rid : existing) {
+                    context_->txn_mgr_->CheckWriteConflict(tab_name_, existing_rid, context_->txn_);
+                    auto visible =
+                        context_->txn_mgr_->GetVisibleRecord(tab_name_, fh_, existing_rid, context_->txn_);
+                    if (visible != nullptr) {
                         throw UniqueIndexViolationError();
-                    }
-                    for (const auto &existing_rid : existing) {
-                        context_->txn_mgr_->CheckWriteConflict(tab_name_, existing_rid, context_->txn_);
-                        auto visible =
-                            context_->txn_mgr_->GetVisibleRecord(tab_name_, fh_, existing_rid, context_->txn_);
-                        if (visible != nullptr) {
-                            throw UniqueIndexViolationError();
-                        }
                     }
                 }
             }
