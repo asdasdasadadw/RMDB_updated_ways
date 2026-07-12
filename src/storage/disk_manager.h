@@ -58,22 +58,27 @@ class DiskManager {
 
     void close_file(int fd);
 
-    int get_file_size(const std::string &file_name);
+    wal_offset_t get_file_size(const std::string &file_name);
 
     std::string get_file_name(int fd);
 
     int get_file_fd(const std::string &file_name);
 
     /*日志操作*/
-    int read_log(char *log_data, int size, int offset);
+    int read_log(char *log_data, int size, wal_offset_t offset);
 
     void write_log(char *log_data, int size);
 
     void sync_log();
 
+    void truncate_log(wal_offset_t size);
+
     void sync_file(int fd);
 
-    void SetLogFd(int log_fd) { log_fd_ = log_fd; }
+    void SetLogFd(int log_fd) {
+        log_fd_ = log_fd;
+        log_write_offset_.store(-1, std::memory_order_relaxed);
+    }
 
     int GetLogFd() { return log_fd_; }
 
@@ -99,6 +104,6 @@ class DiskManager {
     std::unordered_map<int, std::string> fd2path_;  //<Page fd,Page文件磁盘路径>哈希表
 
     int log_fd_ = -1;                             // WAL日志文件的文件句柄，默认为-1，代表未打开日志文件
-    std::atomic<int> log_write_offset_{-1};
+    std::atomic<wal_offset_t> log_write_offset_{-1};
     std::atomic<page_id_t> fd2pageno_[MAX_FD]{};  // 文件中已经分配的页面个数，初始值为0
 };

@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 
 #include <condition_variable>
 #include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -56,7 +57,8 @@ inline void serialize_string(char *dest, int &offset, const std::string &str) {
 }
 
 inline std::string deserialize_string(const char *src, int &offset) {
-    uint32_t len = *reinterpret_cast<const uint32_t *>(src + offset);
+    uint32_t len = 0;
+    memcpy(&len, src + offset, sizeof(uint32_t));
     offset += sizeof(uint32_t);
     std::string str(src + offset, src + offset + len);
     offset += len;
@@ -75,7 +77,8 @@ inline void serialize_record(char *dest, int &offset, const RmRecord &record) {
 }
 
 inline RmRecord deserialize_record(const char *src, int &offset) {
-    int size = *reinterpret_cast<const int *>(src + offset);
+    int size = 0;
+    memcpy(&size, src + offset, sizeof(int));
     offset += sizeof(int);
     RmRecord record(size, const_cast<char *>(src + offset));
     offset += size;
@@ -84,6 +87,8 @@ inline RmRecord deserialize_record(const char *src, int &offset) {
 
 class LogRecord {
 public:
+    virtual ~LogRecord() = default;
+
     LogType log_type_;         /* 日志对应操作的类型 */
     lsn_t lsn_;                /* 当前日志的lsn */
     uint32_t log_tot_len_;     /* 整个日志记录的长度 */
@@ -92,6 +97,8 @@ public:
 
     // 把日志记录序列化到dest中
     virtual void serialize (char* dest) const {
+        memcpy(dest + OFFSET_LOG_MAGIC, &LOG_RECORD_MAGIC, sizeof(uint32_t));
+        memcpy(dest + OFFSET_LOG_VERSION, &LOG_FORMAT_VERSION, sizeof(uint32_t));
         memcpy(dest + OFFSET_LOG_TYPE, &log_type_, sizeof(LogType));
         memcpy(dest + OFFSET_LSN, &lsn_, sizeof(lsn_t));
         memcpy(dest + OFFSET_LOG_TOT_LEN, &log_tot_len_, sizeof(uint32_t));
@@ -100,21 +107,28 @@ public:
     }
     // 从src中反序列化出一条日志记录
     virtual void deserialize(const char* src) {
-        log_type_ = *reinterpret_cast<const LogType*>(src);
-        lsn_ = *reinterpret_cast<const lsn_t*>(src + OFFSET_LSN);
-        log_tot_len_ = *reinterpret_cast<const uint32_t*>(src + OFFSET_LOG_TOT_LEN);
-        log_tid_ = *reinterpret_cast<const txn_id_t*>(src + OFFSET_LOG_TID);
-        prev_lsn_ = *reinterpret_cast<const lsn_t*>(src + OFFSET_PREV_LSN);
+        uint32_t magic = 0;
+        uint32_t version = 0;
+        memcpy(&magic, src + OFFSET_LOG_MAGIC, sizeof(uint32_t));
+        memcpy(&version, src + OFFSET_LOG_VERSION, sizeof(uint32_t));
+        if (magic != LOG_RECORD_MAGIC || version != LOG_FORMAT_VERSION) {
+            throw InternalError("Unsupported WAL format");
+        }
+        memcpy(&log_type_, src + OFFSET_LOG_TYPE, sizeof(LogType));
+        memcpy(&lsn_, src + OFFSET_LSN, sizeof(lsn_t));
+        memcpy(&log_tot_len_, src + OFFSET_LOG_TOT_LEN, sizeof(uint32_t));
+        memcpy(&log_tid_, src + OFFSET_LOG_TID, sizeof(txn_id_t));
+        memcpy(&prev_lsn_, src + OFFSET_PREV_LSN, sizeof(lsn_t));
     }
     // used for debug
     virtual void format_print() {
         std::cout << "log type in father_function: " << LogTypeStr[log_type_] << "\n";
         printf("Print Log Record:\n");
         printf("log_type_: %s\n", LogTypeStr[log_type_].c_str());
-        printf("lsn: %d\n", lsn_);
-        printf("log_tot_len: %d\n", log_tot_len_);
+        std::cout << "lsn: " << lsn_ << "\n";
+        printf("log_tot_len: %u\n", log_tot_len_);
         printf("log_tid: %ld\n", static_cast<long>(log_tid_));
-        printf("prev_lsn: %d\n", prev_lsn_);
+        std::cout << "prev_lsn: " << prev_lsn_ << "\n";
     }
 };
 
@@ -213,7 +227,7 @@ public:
         LogRecord::deserialize(src);
         int offset = OFFSET_LOG_DATA;
         insert_value_ = deserialize_record(src, offset);
-        rid_ = *reinterpret_cast<const Rid*>(src + offset);
+        memcpy(&rid_, src + offset, sizeof(Rid));
         offset += sizeof(Rid);
         table_name_ = deserialize_string(src, offset);
     }
@@ -262,7 +276,7 @@ public:
         LogRecord::deserialize(src);
         int offset = OFFSET_LOG_DATA;
         delete_value_ = deserialize_record(src, offset);
-        rid_ = *reinterpret_cast<const Rid *>(src + offset);
+        memcpy(&rid_, src + offset, sizeof(Rid));
         offset += sizeof(Rid);
         table_name_ = deserialize_string(src, offset);
     }
@@ -309,7 +323,7 @@ public:
         int offset = OFFSET_LOG_DATA;
         old_value_ = deserialize_record(src, offset);
         new_value_ = deserialize_record(src, offset);
-        rid_ = *reinterpret_cast<const Rid *>(src + offset);
+        memcpy(&rid_, src + offset, sizeof(Rid));
         offset += sizeof(Rid);
         table_name_ = deserialize_string(src, offset);
     }

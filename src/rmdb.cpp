@@ -19,6 +19,7 @@ See the Mulan PSL v2 for more details. */
 #include <atomic>
 #include <cctype>
 #include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
@@ -389,6 +390,45 @@ bool is_static_checkpoint_sql(const std::string &sql) {
     return normalized == "CREATE STATIC_CHECKPOINT";
 }
 
+void persist_checkpoint_offset(lsn_t checkpoint_lsn) {
+    const std::string temp_name = CHECKPOINT_FILE_NAME + ".tmp";
+    {
+        std::ofstream checkpoint_file(temp_name, std::ios::out | std::ios::trunc);
+        if (!checkpoint_file.is_open()) {
+            throw InternalError("Failed to open checkpoint metadata temp file");
+        }
+        checkpoint_file << checkpoint_lsn;
+        checkpoint_file.flush();
+        if (!checkpoint_file) {
+            throw InternalError("Failed to write checkpoint metadata");
+        }
+    }
+
+    int checkpoint_fd = open(temp_name.c_str(), O_RDONLY);
+    if (checkpoint_fd < 0) {
+        throw UnixError();
+    }
+    if (fsync(checkpoint_fd) < 0) {
+        close(checkpoint_fd);
+        throw UnixError();
+    }
+    if (close(checkpoint_fd) < 0) {
+        throw UnixError();
+    }
+    if (std::rename(temp_name.c_str(), CHECKPOINT_FILE_NAME.c_str()) < 0) {
+        throw UnixError();
+    }
+
+    // Persist the directory entry after the atomic replacement.  Some test
+    // filesystems do not support directory fsync; the rename is still atomic
+    // for process-kill recovery, so this last durability fence is best effort.
+    int directory_fd = open(".", O_RDONLY);
+    if (directory_fd >= 0) {
+        fsync(directory_fd);
+        close(directory_fd);
+    }
+}
+
 void create_static_checkpoint() {
     std::unique_lock<std::shared_mutex> checkpoint_lock(checkpoint_mutex);
     if (txn_manager->has_active_transaction()) {
@@ -400,23 +440,7 @@ void create_static_checkpoint() {
     lsn_t checkpoint_lsn = log_manager->add_log_to_buffer(&checkpoint);
     log_manager->flush_log_to_disk(true);
     sm_manager->flush_db_files();
-    std::ofstream checkpoint_file(CHECKPOINT_FILE_NAME, std::ios::out | std::ios::trunc);
-    checkpoint_file << checkpoint_lsn;
-    checkpoint_file.flush();
-    checkpoint_file.close();
-    int checkpoint_fd = open(CHECKPOINT_FILE_NAME.c_str(), O_RDONLY);
-    if (checkpoint_fd >= 0) {
-        fsync(checkpoint_fd);
-        close(checkpoint_fd);
-    }
-}
-
-void fsync_file_by_name(const std::string &file_name) {
-    int fd = open(file_name.c_str(), O_RDONLY);
-    if (fd >= 0) {
-        fsync(fd);
-        close(fd);
-    }
+    persist_checkpoint_offset(checkpoint_lsn);
 }
 
 void truncate_log_file() {
@@ -442,11 +466,7 @@ void clean_shutdown_storage() {
     txn_manager->GarbageCollection();
     sm_manager->flush_db_files();
     truncate_log_file();
-    std::ofstream checkpoint_file(CHECKPOINT_FILE_NAME, std::ios::out | std::ios::trunc);
-    checkpoint_file << 0;
-    checkpoint_file.flush();
-    checkpoint_file.close();
-    fsync_file_by_name(CHECKPOINT_FILE_NAME);
+    persist_checkpoint_offset(0);
 }
 
 void append_failure_result() {

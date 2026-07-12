@@ -14,6 +14,7 @@ See the Mulan PSL v2 for more details. */
 #include <chrono>
 #include <cstring>
 #include <exception>
+#include <limits>
 
 namespace {
 
@@ -25,8 +26,12 @@ void LogManager::init_lsn_locked() {
     if (next_lsn_ != INVALID_LSN) {
         return;
     }
-    int file_size = disk_manager_->is_file(LOG_FILE_NAME) ? disk_manager_->get_file_size(LOG_FILE_NAME) : 0;
-    next_lsn_ = std::max(0, file_size);
+    wal_offset_t file_size =
+        disk_manager_->is_file(LOG_FILE_NAME) ? disk_manager_->get_file_size(LOG_FILE_NAME) : 0;
+    if (file_size < 0) {
+        throw InternalError("Failed to determine WAL size");
+    }
+    next_lsn_ = file_size;
     persist_lsn_ = next_lsn_ == 0 ? INVALID_LSN : next_lsn_ - 1;
     durable_lsn_ = persist_lsn_;
 }
@@ -109,6 +114,9 @@ lsn_t LogManager::add_log_to_buffer(LogRecord *log_record) {
         flush_log_to_disk_locked(&lock, false);
     }
     init_lsn_locked();
+    if (next_lsn_ > std::numeric_limits<lsn_t>::max() - log_record->log_tot_len_) {
+        throw InternalError("WAL LSN overflow");
+    }
     log_record->lsn_ = next_lsn_;
     log_record->serialize(active_buffer_->buffer_ + active_buffer_->offset_);
     active_buffer_->offset_ += static_cast<int>(log_record->log_tot_len_);

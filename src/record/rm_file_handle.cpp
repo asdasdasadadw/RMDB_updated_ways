@@ -10,6 +10,8 @@ See the Mulan PSL v2 for more details. */
 
 #include "rm_file_handle.h"
 
+#include <limits>
+
 /**
  * @description: 获取当前表中记录号为rid的记录
  * @param {Rid&} rid 记录号，指定记录的位置
@@ -192,11 +194,15 @@ void RmFileHandle::flush() {
 }
 
 void RmFileHandle::sync_header_with_disk_size() {
-    int file_size = disk_manager_->get_file_size(disk_manager_->get_file_name(fd_));
+    wal_offset_t file_size = disk_manager_->get_file_size(disk_manager_->get_file_name(fd_));
     if (file_size <= 0) {
         return;
     }
-    int disk_pages = (file_size + PAGE_SIZE - 1) / PAGE_SIZE;
+    wal_offset_t disk_pages_64 = (file_size + PAGE_SIZE - 1) / PAGE_SIZE;
+    if (disk_pages_64 > std::numeric_limits<int>::max()) {
+        throw InternalError("Record file has too many pages");
+    }
+    int disk_pages = static_cast<int>(disk_pages_64);
     if (disk_pages > file_hdr_.num_pages) {
         file_hdr_.num_pages = disk_pages;
         disk_manager_->set_fd2pageno(fd_, file_hdr_.num_pages);

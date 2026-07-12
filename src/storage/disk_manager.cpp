@@ -12,11 +12,14 @@ See the Mulan PSL v2 for more details. */
 
 #include <assert.h>    // for assert
 #include <cerrno>
+#include <limits>
 #include <string.h>    // for memset
 #include <sys/stat.h>  // for stat
 #include <unistd.h>    // for lseek
 
 #include "defs.h"
+
+static_assert(sizeof(off_t) >= sizeof(wal_offset_t), "RMDB requires 64-bit file offsets");
 
 DiskManager::DiskManager() {
     for (int i = 0; i < MAX_FD; ++i) {
@@ -195,10 +198,10 @@ void DiskManager::close_file(int fd) {
  * @return {int} 文件的大小
  * @param {string} &file_name 文件名
  */
-int DiskManager::get_file_size(const std::string &file_name) {
+wal_offset_t DiskManager::get_file_size(const std::string &file_name) {
     struct stat stat_buf;
     int rc = stat(file_name.c_str(), &stat_buf);
-    return rc == 0 ? stat_buf.st_size : -1;
+    return rc == 0 ? static_cast<wal_offset_t>(stat_buf.st_size) : -1;
 }
 
 /**
@@ -233,19 +236,23 @@ int DiskManager::get_file_fd(const std::string &file_name) {
  * @param {int} size 读取的数据量大小
  * @param {int} offset 读取的内容在文件中的位置
  */
-int DiskManager::read_log(char *log_data, int size, int offset) {
+int DiskManager::read_log(char *log_data, int size, wal_offset_t offset) {
+    if (log_data == nullptr || size < 0 || offset < 0) {
+        return -1;
+    }
     // read log file from the previous end
     if (log_fd_ == -1) {
         log_fd_ = open_file(LOG_FILE_NAME);
     }
-    int file_size = get_file_size(LOG_FILE_NAME);
-    if (offset > file_size) {
+    wal_offset_t file_size = get_file_size(LOG_FILE_NAME);
+    if (file_size < 0 || offset > file_size) {
         return -1;
     }
 
-    size = std::min(size, file_size - offset);
+    wal_offset_t available = file_size - offset;
+    size = static_cast<int>(std::min<wal_offset_t>(size, available));
     if(size == 0) return 0;
-    ssize_t bytes_read = pread(log_fd_, log_data, size, offset);
+    ssize_t bytes_read = pread(log_fd_, log_data, size, static_cast<off_t>(offset));
     assert(bytes_read == size);
     return bytes_read;
 }
@@ -260,13 +267,19 @@ void DiskManager::write_log(char *log_data, int size) {
     if (log_fd_ == -1) {
         log_fd_ = open_file(LOG_FILE_NAME);
     }
-    int offset = log_write_offset_.load(std::memory_order_relaxed);
+    wal_offset_t offset = log_write_offset_.load(std::memory_order_relaxed);
     if (offset < 0) {
         offset = get_file_size(LOG_FILE_NAME);
+        if (offset < 0) {
+            throw InternalError("Failed to determine WAL size");
+        }
         log_write_offset_.store(offset, std::memory_order_relaxed);
     }
+    if (size < 0 || offset > std::numeric_limits<wal_offset_t>::max() - size) {
+        throw InternalError("WAL offset overflow");
+    }
     offset = log_write_offset_.fetch_add(size, std::memory_order_relaxed);
-    ssize_t bytes_write = pwrite(log_fd_, log_data, size, offset);
+    ssize_t bytes_write = pwrite(log_fd_, log_data, size, static_cast<off_t>(offset));
     if (bytes_write != size) {
         throw UnixError();
     }
@@ -282,6 +295,22 @@ void DiskManager::sync_log() {
     if (fdatasync(log_fd_) < 0) {
         throw UnixError();
     }
+}
+
+void DiskManager::truncate_log(wal_offset_t size) {
+    if (size < 0 || size > static_cast<wal_offset_t>(std::numeric_limits<off_t>::max())) {
+        throw InternalError("Invalid WAL truncate offset");
+    }
+    if (log_fd_ == -1) {
+        log_fd_ = get_file_fd(LOG_FILE_NAME);
+    }
+    if (ftruncate(log_fd_, static_cast<off_t>(size)) < 0) {
+        throw UnixError();
+    }
+    if (fdatasync(log_fd_) < 0) {
+        throw UnixError();
+    }
+    log_write_offset_.store(size, std::memory_order_release);
 }
 
 void DiskManager::sync_file(int fd) {

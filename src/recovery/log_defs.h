@@ -18,10 +18,18 @@ See the Mulan PSL v2 for more details. */
 #include <chrono>
 
 static constexpr std::chrono::duration<int64_t> FLUSH_TIMEOUT = std::chrono::seconds(3);
+static constexpr uint32_t LOG_RECORD_MAGIC = 0x524d4442U;  // "RMDB"
+static constexpr uint32_t LOG_FORMAT_VERSION = 2U;
+// Every record carries a format marker so a v1 WAL cannot be silently parsed
+// with the wider v2 LSN layout.
+static constexpr int OFFSET_LOG_MAGIC = 0;
+static constexpr int OFFSET_LOG_VERSION = OFFSET_LOG_MAGIC + sizeof(uint32_t);
 // the offset of log_type_ in log header
-static constexpr int OFFSET_LOG_TYPE = 0;
+static constexpr int OFFSET_LOG_TYPE = OFFSET_LOG_VERSION + sizeof(uint32_t);
 // the offset of lsn_ in log header
-static constexpr int OFFSET_LSN = sizeof(int);
+// LogType is declared after this header is included, but its underlying type is
+// explicitly int. Keep the on-disk layout independent of declaration order.
+static constexpr int OFFSET_LSN = OFFSET_LOG_TYPE + sizeof(int);
 // the offset of log_tot_len_ in log header
 static constexpr int OFFSET_LOG_TOT_LEN = OFFSET_LSN + sizeof(lsn_t);
 // the offset of log_tid_ in log header
