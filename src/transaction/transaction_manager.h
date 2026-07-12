@@ -21,6 +21,7 @@ See the Mulan PSL v2 for more details. */
 #include <memory>
 #include <shared_mutex>
 #include <mutex>
+#include <vector>
 
 #include "transaction.h"
 #include "watermark.h"
@@ -90,6 +91,8 @@ public:
     std::mutex &GetRecordWriteLatch(const std::string &tab_name, const Rid &rid);
 
     std::mutex &GetIndexKeyLatch(const std::string &key);
+
+    std::vector<std::unique_lock<std::mutex>> LockIndexKeys(std::vector<std::string> keys);
 
     std::shared_mutex &GetMvccGcLatch() { return mvcc_gc_latch_; }
 

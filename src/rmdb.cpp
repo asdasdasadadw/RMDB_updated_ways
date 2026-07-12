@@ -291,38 +291,6 @@ Value parse_load_value(const std::string &field, const ColMeta &col) {
     return value;
 }
 
-void write_load_field(const std::string &field, const ColMeta &col, char *dest) {
-    if (col.type == TYPE_INT) {
-        int value = std::stoi(field);
-        memcpy(dest, &value, sizeof(int));
-        return;
-    }
-    if (col.type == TYPE_FLOAT) {
-        float value = std::stof(field);
-        memcpy(dest, &value, sizeof(float));
-        return;
-    }
-    if (col.type == TYPE_STRING) {
-        if (field.size() > static_cast<size_t>(col.len)) {
-            throw StringOverflowError();
-        }
-        memset(dest, 0, col.len);
-        memcpy(dest, field.data(), field.size());
-        return;
-    }
-    throw InternalError("Unexpected column type");
-}
-
-std::vector<char> build_load_index_key(const RmRecord &record, const IndexMeta &index) {
-    std::vector<char> key(index.col_tot_len);
-    int offset = 0;
-    for (const auto &col : index.cols) {
-        memcpy(key.data() + offset, record.data + col.offset, col.len);
-        offset += col.len;
-    }
-    return key;
-}
-
 bool parse_load_command(const std::string &sql, std::string *file_name, std::string *table_name) {
     std::string stmt = trim_sql_text(sql);
     if (!starts_with_keyword(stmt, "load")) {
@@ -359,74 +327,6 @@ void load_csv_into_table(const std::string &file_name, const std::string &table_
     std::ifstream input(file_name);
     if (!input.is_open()) {
         throw FileNotFoundError(file_name);
-    }
-
-    bool fast_load = context != nullptr && context->txn_ != nullptr && !context->txn_->get_txn_mode();
-    if (fast_load) {
-        struct LoadIndex {
-            const IndexMeta *meta;
-            IxIndexHandle *handle;
-        };
-        std::vector<LoadIndex> indexes;
-        indexes.reserve(tab.indexes.size());
-        for (const auto &index : tab.indexes) {
-            indexes.push_back({&index, sm_manager->ihs_.at(
-                                           sm_manager->get_ix_manager()->get_index_name(table_name, index.cols))
-                                           .get()});
-        }
-
-        RmFileHandle *fh = sm_manager->fhs_.at(table_name).get();
-        int record_size = fh->get_file_hdr().record_size;
-        std::string line;
-        bool first_line = true;
-        bool has_runtime_cache = RuntimeFilterCache::Get().has_table_entries(table_name);
-        while (std::getline(input, line)) {
-            if (!line.empty() && line.back() == '\r') {
-                line.pop_back();
-            }
-            if (line.empty()) {
-                continue;
-            }
-            auto fields = split_csv_line(line);
-            if (first_line && is_csv_header(fields, tab)) {
-                first_line = false;
-                continue;
-            }
-            first_line = false;
-            if (fields.size() != tab.cols.size()) {
-                throw InvalidValueCountError();
-            }
-
-            RmRecord record(record_size);
-            for (size_t i = 0; i < fields.size(); ++i) {
-                write_load_field(fields[i], tab.cols[i], record.data + tab.cols[i].offset);
-            }
-
-            std::vector<std::pair<IxIndexHandle *, std::vector<char>>> index_entries;
-            index_entries.reserve(indexes.size());
-            for (const auto &index : indexes) {
-                auto key = build_load_index_key(record, *index.meta);
-                std::vector<Rid> existing;
-                if (index.handle->get_value(key.data(), &existing, nullptr)) {
-                    throw UniqueIndexViolationError();
-                }
-                index_entries.emplace_back(index.handle, std::move(key));
-            }
-
-            Rid rid = fh->insert_record(record.data, nullptr);
-            for (auto &entry : index_entries) {
-                entry.first->insert_entry(entry.second.data(), rid, nullptr);
-            }
-            if (has_runtime_cache) {
-                RuntimeFilterCache::Get().insert_record(table_name, rid, record, tab);
-            }
-        }
-        fh->flush();
-        for (const auto &index : indexes) {
-            index.handle->flush();
-        }
-        sm_manager->flush_meta();
-        return;
     }
 
     IsolationLevel saved_isolation = IsolationLevel::READ_COMMITTED;

@@ -131,16 +131,9 @@ class DeleteExecutor : public AbstractExecutor {
 
     static std::vector<std::unique_lock<std::mutex>> lock_index_keys(
         TransactionManager *txn_mgr, std::vector<std::string> keys) {
-        std::vector<std::unique_lock<std::mutex>> locks;
-        if (txn_mgr == nullptr || keys.empty()) {
-            return locks;
+        if (txn_mgr == nullptr) {
+            return {};
         }
-        std::sort(keys.begin(), keys.end());
-        keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
-        locks.reserve(keys.size());
-        for (const auto &key : keys) {
-            locks.emplace_back(txn_mgr->GetIndexKeyLatch(key));
-        }
-        return locks;
+        return txn_mgr->LockIndexKeys(std::move(keys));
     }
 };

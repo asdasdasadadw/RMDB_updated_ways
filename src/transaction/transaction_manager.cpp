@@ -63,17 +63,10 @@ void append_index_lock_keys(const std::string &tab_name, const TabMeta &tab, con
 
 std::vector<std::unique_lock<std::mutex>> lock_index_keys(TransactionManager *txn_mgr,
                                                          std::vector<std::string> keys) {
-    std::vector<std::unique_lock<std::mutex>> locks;
-    if (txn_mgr == nullptr || keys.empty()) {
-        return locks;
+    if (txn_mgr == nullptr) {
+        return {};
     }
-    std::sort(keys.begin(), keys.end());
-    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
-    locks.reserve(keys.size());
-    for (const auto &key : keys) {
-        locks.emplace_back(txn_mgr->GetIndexKeyLatch(key));
-    }
-    return locks;
+    return txn_mgr->LockIndexKeys(std::move(keys));
 }
 
 void insert_indexes(SmManager *sm_manager, const TabMeta &tab, const std::string &tab_name,
@@ -879,6 +872,26 @@ std::mutex &TransactionManager::GetRecordWriteLatch(const std::string &tab_name,
 
 std::mutex &TransactionManager::GetIndexKeyLatch(const std::string &key) {
     return index_key_latches_[std::hash<std::string>()(key) % index_key_latches_.size()];
+}
+
+std::vector<std::unique_lock<std::mutex>> TransactionManager::LockIndexKeys(std::vector<std::string> keys) {
+    std::vector<std::mutex *> latches;
+    latches.reserve(keys.size());
+    for (const auto &key : keys) {
+        latches.push_back(&GetIndexKeyLatch(key));
+    }
+
+    // Logical keys can hash to the same latch. Lock each physical latch once and
+    // use one global order so a collision cannot self-deadlock or invert order.
+    std::sort(latches.begin(), latches.end(), std::less<std::mutex *>());
+    latches.erase(std::unique(latches.begin(), latches.end()), latches.end());
+
+    std::vector<std::unique_lock<std::mutex>> locks;
+    locks.reserve(latches.size());
+    for (auto *latch : latches) {
+        locks.emplace_back(*latch);
+    }
+    return locks;
 }
 
 void TransactionManager::EnsureBaseVersionLocked(const RecordKey &key, const RmRecord &base_record) {
