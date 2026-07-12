@@ -188,7 +188,11 @@ void RecoveryManager::analyze() {
                 redo_txns_.insert(log->log_tid_);
                 break;
             case LogType::ABORT:
-                undo_txns_.erase(log->log_tid_);
+                // There are no compensation log records and abort does not
+                // force the rollback pages to disk.  A steal before abort can
+                // therefore leave an uncommitted value on disk, so an aborted
+                // writer must still be undone during crash recovery.
+                undo_txns_.insert(log->log_tid_);
                 break;
             default:
                 break;

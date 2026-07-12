@@ -15,6 +15,7 @@ See the Mulan PSL v2 for more details. */
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <cerrno>
@@ -466,6 +467,18 @@ void write_failure_result(char *data_send, int *offset) {
     append_failure_result();
 }
 
+void write_rmdb_error_result(RMDBError &error, char *data_send, int *offset) {
+    std::string str = "failure\n";
+    size_t remaining = BUFFER_LENGTH - str.size() - 2;
+    size_t error_len = std::min(static_cast<size_t>(error.get_msg_len()), remaining);
+    str.append(error.what(), error_len);
+    str.push_back('\n');
+    memcpy(data_send, str.data(), str.size());
+    data_send[str.size()] = '\0';
+    *offset = static_cast<int>(str.size());
+    append_failure_result();
+}
+
 void write_abort_result(char *data_send, int *offset) {
     std::string str = "abort\n";
     memcpy(data_send, str.c_str(), str.length());
@@ -660,11 +673,7 @@ void execute_sql_statement(const std::string &sql, txn_id_t *txn_id, Transaction
             }
         } catch (RMDBError &e) {
             ok = false;
-            memcpy(data_send, e.what(), e.get_msg_len());
-            data_send[e.get_msg_len()] = '\n';
-            data_send[e.get_msg_len() + 1] = '\0';
-            *offset = e.get_msg_len() + 1;
-            append_failure_result();
+            write_rmdb_error_result(e, data_send, offset);
             if (context.txn_ != nullptr && context.txn_->get_state() == TransactionState::GROWING) {
                 abort_session_transaction(txn_id, session_txn);
             }
@@ -702,11 +711,7 @@ void execute_sql_statement(const std::string &sql, txn_id_t *txn_id, Transaction
         }
         handled_fast = true;
     } catch (RMDBError &e) {
-        memcpy(data_send, e.what(), e.get_msg_len());
-        data_send[e.get_msg_len()] = '\n';
-        data_send[e.get_msg_len() + 1] = '\0';
-        *offset = e.get_msg_len() + 1;
-        append_failure_result();
+        write_rmdb_error_result(e, data_send, offset);
         if (context.txn_ != nullptr && context.txn_->get_state() == TransactionState::GROWING) {
             abort_session_transaction(txn_id, session_txn);
         }
@@ -773,12 +778,7 @@ void execute_sql_statement(const std::string &sql, txn_id_t *txn_id, Transaction
             outfile.close();
         }
     } catch (RMDBError &e) {
-        memcpy(data_send, e.what(), e.get_msg_len());
-        data_send[e.get_msg_len()] = '\n';
-        data_send[e.get_msg_len() + 1] = '\0';
-        *offset = e.get_msg_len() + 1;
-
-        append_failure_result();
+        write_rmdb_error_result(e, data_send, offset);
         if (context.txn_ != nullptr && context.txn_->get_state() == TransactionState::GROWING) {
             abort_session_transaction(txn_id, session_txn);
         }
@@ -810,9 +810,14 @@ bool run_batch_sql_if_present() {
     for (const auto &stmt : split_sql_statements(input)) {
         std::string first_keyword = first_sql_keyword(stmt.c_str());
         TxnCommand txn_cmd = is_txn_command_keyword(first_keyword) ? get_txn_command(stmt) : TxnCommand::None;
-        if (explicit_txn_failed && txn_cmd != TxnCommand::Abort && txn_cmd != TxnCommand::Rollback &&
-            txn_cmd != TxnCommand::Commit) {
+        if (explicit_txn_failed) {
             write_abort_result(data_send, &offset);
+            if (txn_cmd == TxnCommand::Abort || txn_cmd == TxnCommand::Rollback || txn_cmd == TxnCommand::Commit) {
+                in_explicit_txn = false;
+                explicit_txn_failed = false;
+                txn_id = INVALID_TXN_ID;
+                session_txn = nullptr;
+            }
             continue;
         }
         execute_sql_statement(stmt, &txn_id, &session_txn, data_send, &offset, &session_isolation_level);
@@ -877,9 +882,14 @@ void *client_handler(void *sock_fd) {
 
         std::string first_keyword = first_sql_keyword(data_recv);
         TxnCommand txn_cmd = is_txn_command_keyword(first_keyword) ? get_txn_command(data_recv) : TxnCommand::None;
-        if (explicit_txn_failed && txn_cmd != TxnCommand::Abort && txn_cmd != TxnCommand::Rollback &&
-            txn_cmd != TxnCommand::Commit) {
+        if (explicit_txn_failed) {
             write_abort_result(data_send, &offset);
+            if (txn_cmd == TxnCommand::Abort || txn_cmd == TxnCommand::Rollback || txn_cmd == TxnCommand::Commit) {
+                in_explicit_txn = false;
+                explicit_txn_failed = false;
+                txn_id = INVALID_TXN_ID;
+                session_txn = nullptr;
+            }
             data_send[offset] = '\0';
             if (write(fd, data_send, offset + 1) == -1) {
                 break;
@@ -956,11 +966,7 @@ void *client_handler(void *sock_fd) {
             } catch (RMDBError &e) {
                 ok = false;
                 std::cerr << e.what() << std::endl;
-                memcpy(data_send, e.what(), e.get_msg_len());
-                data_send[e.get_msg_len()] = '\n';
-                data_send[e.get_msg_len() + 1] = '\0';
-                offset = e.get_msg_len() + 1;
-                append_failure_result();
+                write_rmdb_error_result(e, data_send, &offset);
                 if (context.txn_ != nullptr && context.txn_->get_state() == TransactionState::GROWING) {
                     abort_session_transaction(&txn_id, &session_txn);
                 }
@@ -974,6 +980,9 @@ void *client_handler(void *sock_fd) {
                 }
                 txn_id = INVALID_TXN_ID;
                 session_txn = nullptr;
+            }
+            if (in_explicit_txn && txn_id == INVALID_TXN_ID) {
+                explicit_txn_failed = true;
             }
             data_send[offset] = '\0';
             if (write(fd, data_send, offset + 1) == -1) {
@@ -1002,12 +1011,7 @@ void *client_handler(void *sock_fd) {
             handled_fast = true;
         } catch (RMDBError &e) {
             std::cerr << e.what() << std::endl;
-            memcpy(data_send, e.what(), e.get_msg_len());
-            data_send[e.get_msg_len()] = '\n';
-            data_send[e.get_msg_len() + 1] = '\0';
-            offset = e.get_msg_len() + 1;
-
-            append_failure_result();
+            write_rmdb_error_result(e, data_send, &offset);
             if (context.txn_ != nullptr && context.txn_->get_state() == TransactionState::GROWING) {
                 abort_session_transaction(&txn_id, &session_txn);
             }
@@ -1078,12 +1082,7 @@ void *client_handler(void *sock_fd) {
                     // 遇到异常，需要打印failure到output.txt文件中，并发异常信息返回给客户端
                     std::cerr << e.what() << std::endl;
 
-                    memcpy(data_send, e.what(), e.get_msg_len());
-                    data_send[e.get_msg_len()] = '\n';
-                    data_send[e.get_msg_len() + 1] = '\0';
-                    offset = e.get_msg_len() + 1;
-
-                    append_failure_result();
+                    write_rmdb_error_result(e, data_send, &offset);
                     if (context.txn_ != nullptr && context.txn_->get_state() == TransactionState::GROWING) {
                         abort_session_transaction(&txn_id, &session_txn);
                     }
@@ -1228,8 +1227,17 @@ int main(int argc, char **argv) {
             txn_manager->set_next_txn_id(recovery->max_txn_id() + 1);
         }
         bool recovered_from_log = recovery->has_recovery_work();
-        recovery->redo();
+        // Undo all losers first, including transactions that logged ABORT but
+        // whose rollback pages were not forced.  Redo committed transactions
+        // afterwards so a committed reuse of the same RID wins deterministically.
+        // Rebuild the free lists before replay as well: a crash may persist a
+        // record page without the matching in-memory file-header update, and
+        // the fixed-RID undo/redo helpers require an acyclic free list.
+        if (recovered_from_log) {
+            sm_manager->rebuild_table_free_lists();
+        }
         recovery->undo();
+        recovery->redo();
         if (recovered_from_log) {
             sm_manager->rebuild_table_free_lists();
             sm_manager->rebuild_indexes();
